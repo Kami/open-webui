@@ -27,7 +27,11 @@ ARG BUILD_HASH
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# ci always removes cache which causes unncessary long docker build images time
+# due to no layer cache re-use
+#RUN npm ci
+RUN npm install
+#RUN --mount=type=cache,target=/root/.npm npm install
 
 COPY . .
 ENV APP_BUILD_HASH=${BUILD_HASH}

@@ -9,8 +9,9 @@ import os
 import random
 import re
 import time
-from typing import Optional, Union
+from typing import Optional, Dict, Union
 from urllib.parse import urlparse
+from contextlib import asynccontextmanager
 
 import aiohttp
 from aiocache import cached
@@ -31,6 +32,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
 
+from opentelemetry import metrics
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.instrumentation.aiohttp_client import create_trace_config
+from prometheus_client import start_http_server
 
 from open_webui.models.models import Models
 from open_webui.utils.misc import (
@@ -61,20 +67,83 @@ log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
 
 
+AIOHTTP_CLIENT_SESSION = None
+
+# Set up OpenTelemetry metrics
+reader = PrometheusMetricReader()
+provider = MeterProvider(metric_readers=[reader])
+metrics.set_meter_provider(provider)
+meter = metrics.get_meter("aiohttp_client")
+
+REQUEST_COUNTER = meter.create_counter(
+    name="http_requests_total",
+    description="Total number of HTTP requests"
+)
+REQUEST_LATENCY = meter.create_histogram(
+    name="http_request_duration_milliseconds",
+    description="HTTP request latency in milliseconds",
+    unit="ms",
+)
+
+start_http_server(8081)
+
+
 ##########################################
 #
 # Utility functions
 #
 ##########################################
 
+@asynccontextmanager
+async def measure_request_latency(attributes: Optional[Dict[str, str]] = None):
+    """
+    Context manager to measure request latency and record it.
+
+    :param attributes: Dictionary with attributes / labels for the histogram.
+    """
+    attributes = attributes or {}
+    start_time = time.perf_counter_ns()
+    try:
+        yield  # Allow the block of code to execute
+    finally:
+        duration_ms = (time.perf_counter_ns() - start_time) // 1_000_000
+        REQUEST_LATENCY.record(duration_ms, attributes)
+
+
+async def get_aiohttp_session() -> aiohttp.ClientSession:
+    """
+    Return aiohttp.ClientSession which can be re-used for all the requests to the
+    Ollama API endpoints.
+
+    To ensure underlying HTTP / TCP connections are re-used and to avoid connection
+    establish + TLS handshake overhead it's important all the requests to the Ollama
+    API endpoints re-use the same ClientSession.
+
+    It's also important context manager (with) is not used with the returned session
+    object since this means session will be closed when the block is finished.
+    """
+    # TODO: Allow user to disable session / connection re-use via env variable
+    global AIOHTTP_CLIENT_SESSION
+
+    if not AIOHTTP_CLIENT_SESSION:
+        # TODO: Define environment variable / settings for those options
+        trace_config = create_trace_config()
+        connector = aiohttp.TCPConnector(limit_per_host=10, keepalive_timeout=300)
+        AIOHTTP_CLIENT_SESSION = aiohttp.ClientSession(connector=connector, trust_env=True,
+                                                       trace_configs=[trace_config])
+
+    return AIOHTTP_CLIENT_SESSION
+
 
 async def send_get_request(url, key=None):
+    session = await get_aiohttp_session()
     timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     try:
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with measure_request_latency(attributes={"method": "GET", "url": url}):
             async with session.get(
-                url, headers={**({"Authorization": f"Bearer {key}"} if key else {})}
+                url, timeout=timeout, headers={**({"Authorization": f"Bearer {key}"} if key else {})}
             ) as response:
+                REQUEST_COUNTER.add(1, {"method": "GET", "status": response.status})
                 return await response.json()
     except Exception as e:
         # Handle connection error here
@@ -89,7 +158,10 @@ async def cleanup_response(
     if response:
         response.close()
     if session:
-        await session.close()
+        pass
+        # TODO: If we close the session, underlying connection won't be re-used (keep-alive)
+        # which will result in worse performance.
+        #await session.close()
 
 
 async def send_post_request(
@@ -98,22 +170,25 @@ async def send_post_request(
     stream: bool = True,
     key: Optional[str] = None,
     content_type: Optional[str] = None,
+    model: Optional[str] = None,
 ):
 
     r = None
     try:
-        session = aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        )
+        session = await get_aiohttp_session()
+        timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
 
-        r = await session.post(
-            url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                **({"Authorization": f"Bearer {key}"} if key else {}),
-            },
-        )
+        async with measure_request_latency(attributes={"method": "POST", "url": url, "model": model}):
+            r = await session.post(
+                url,
+                timeout=timeout,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    **({"Authorization": f"Bearer {key}"} if key else {}),
+                },
+            )
+        REQUEST_COUNTER.add(1, {"method": "POST", "status": r.status})
         r.raise_for_status()
 
         if stream:
@@ -187,6 +262,7 @@ async def verify_connection(
     url = form_data.url
     key = form_data.key
 
+    # NOTE: We intentionally don't re-use the main session object for verify connection.
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_OPENAI_MODEL_LIST)
     ) as session:
@@ -511,6 +587,7 @@ async def pull_model(
         url=f"{url}/api/pull",
         payload=json.dumps(payload),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=form_data.name,
     )
 
 
@@ -547,6 +624,7 @@ async def push_model(
         url=f"{url}/api/push",
         payload=form_data.model_dump_json(exclude_none=True).encode(),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=form_data.name,
     )
 
 
@@ -573,6 +651,7 @@ async def create_model(
         url=f"{url}/api/create",
         payload=form_data.model_dump_json(exclude_none=True).encode(),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=form_data.name,
     )
 
 
@@ -933,6 +1012,7 @@ async def generate_completion(
         url=f"{url}/api/generate",
         payload=form_data.model_dump_json(exclude_none=True).encode(),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=model,
     )
 
 
@@ -1046,6 +1126,7 @@ async def generate_chat_completion(
         stream=form_data.stream,
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
         content_type="application/x-ndjson",
+        model=payload.get("model")
     )
 
 
@@ -1148,6 +1229,7 @@ async def generate_openai_completion(
         payload=json.dumps(payload),
         stream=payload.get("stream", False),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=payload.get("model"),
     )
 
 
@@ -1224,6 +1306,7 @@ async def generate_openai_chat_completion(
         payload=json.dumps(payload),
         stream=payload.get("stream", False),
         key=get_api_key(url_idx, url, request.app.state.config.OLLAMA_API_CONFIGS),
+        model=payload.get("model"),
     )
 
 
